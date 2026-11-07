@@ -309,7 +309,9 @@ impl LayoutBuilder<'_> {
                 MathNode::Fenced { open, close, body, .. } => {
                     self.layout_fenced(index, open, close, body)?
                 },
-                MathNode::Accent { accent, body, .. } => self.layout_accent(index, accent, body)?,
+                MathNode::Accent { accent, body, below, stretchy, .. } => {
+                    self.layout_accent(index, accent, body, below, stretchy)?
+                },
                 MathNode::Matrix { rows, alignments, .. } => {
                     self.layout_matrix(index, rows, alignments)?
                 },
@@ -681,7 +683,7 @@ impl LayoutBuilder<'_> {
         subscript: Option<NodeId>,
         superscript: Option<NodeId>,
     ) -> Result<Geometry, MathError> {
-        let base_plan = self.plans[base.0 as usize];
+        let mut base_plan = self.plans[base.0 as usize];
         let pixel_size = self.pixel_size(index)?;
         let mut width = base_plan.metrics.width;
         if let Some(node) = subscript {
@@ -690,9 +692,29 @@ impl LayoutBuilder<'_> {
         if let Some(node) = superscript {
             width = width.max(self.plans[node.0 as usize].metrics.width);
         }
+        // Extensible arrows own the label width; centering a natural arrow
+        // in a wide script box leaves only a tiny arrow under the annotation.
+        let glyph_start = self.glyphs.len();
+        let stretched = if let Some(character) = self.labelled_arrow(base) {
+            let glyph = self
+                .font
+                .glyph_id(character)
+                .map_err(|_| MathError::new(MathErrorKind::MissingGlyph, 0))?;
+            let geometry =
+                self.horizontal_glyph_box(glyph, width + pixel_size * 0.5, pixel_size)?;
+            base_plan.metrics = geometry.metrics;
+            width = width.max(base_plan.metrics.width);
+            true
+        } else {
+            false
+        };
         let base_x = (width - base_plan.metrics.width) * 0.5;
         let mut metrics = self.empty_metrics(index)?;
-        self.place(base, base_x, 0.0);
+        if stretched {
+            self.shift_glyphs(glyph_start, base_x, 0.0);
+        } else {
+            self.place(base, base_x, 0.0);
+        }
         include_child(&mut metrics, base_plan.metrics, base_x, 0.0);
         if let Some(superscript) = superscript {
             let plan = self.plans[superscript.0 as usize];
@@ -714,6 +736,25 @@ impl LayoutBuilder<'_> {
         }
         metrics.width = metrics.width.max(width);
         Ok(Geometry { metrics, class: base_plan.class, italic_correction: 0.0 })
+    }
+
+    fn labelled_arrow(&self, mut node: NodeId) -> Option<char> {
+        loop {
+            match self.formula.arena.node(node) {
+                MathNode::Glyph {
+                    character: character @ ('←' | '→'),
+                    class: AtomClass::Rel,
+                    ..
+                } => {
+                    return Some(*character);
+                },
+                MathNode::Row(children) => {
+                    let [child] = self.formula.arena.children(*children) else { return None };
+                    node = *child;
+                },
+                _ => return None,
+            }
+        }
     }
 
     fn layout_radical(
@@ -854,25 +895,31 @@ impl LayoutBuilder<'_> {
         index: usize,
         accent: char,
         body: NodeId,
+        below: bool,
+        stretchy: bool,
     ) -> Result<Geometry, MathError> {
         let body_plan = self.plans[body.0 as usize];
         let pixel_size = self.pixel_size(index)?;
-        if accent == '\u{203e}' {
-            // Overbars are rules, not dependent on a U+203E font glyph.
-            let gap = self.constant(MathConstant::OverbarVerticalGap, pixel_size)?;
-            let rule = self.constant(MathConstant::OverbarRuleThickness, pixel_size)?.max(0.5);
+        if matches!((accent, below), ('‾', false) | ('_', true)) {
+            let (gap_constant, rule_constant) = if below {
+                (MathConstant::UnderbarVerticalGap, MathConstant::UnderbarRuleThickness)
+            } else {
+                (MathConstant::OverbarVerticalGap, MathConstant::OverbarRuleThickness)
+            };
+            let gap = self.constant(gap_constant, pixel_size)?;
+            let rule = self.constant(rule_constant, pixel_size)?.max(0.5);
+            let y = if below {
+                body_plan.metrics.depth + gap
+            } else {
+                -body_plan.metrics.height - gap - rule
+            };
             self.place(body, 0.0, 0.0);
-            self.push_rule(LocalRule {
-                x: 0.0,
-                y: -body_plan.metrics.height - gap - rule,
-                width: body_plan.metrics.width,
-                height: rule,
-            })?;
+            self.push_rule(LocalRule { x: 0.0, y, width: body_plan.metrics.width, height: rule })?;
             let mut metrics = body_plan.metrics;
-            metrics.height += gap + rule;
+            include_rule(&mut metrics, 0.0, y, body_plan.metrics.width, rule);
             return Ok(Geometry {
                 metrics,
-                class: Some(AtomClass::Ord),
+                class: body_plan.class,
                 italic_correction: body_plan.italic_correction,
             });
         }
@@ -881,23 +928,76 @@ impl LayoutBuilder<'_> {
             .glyph_id(accent)
             .map_err(|_| MathError::new(MathErrorKind::MissingGlyph, 0))?;
         let glyph_start = self.glyphs.len();
-        let accent_box = self.horizontal_glyph_box(glyph, body_plan.metrics.width, pixel_size)?;
-        let gap = (self.constant(MathConstant::AccentBaseHeight, pixel_size)?
-            - body_plan.metrics.height)
-            .max(0.0);
-        let x = ((body_plan.metrics.width - accent_box.metrics.width) * 0.5).max(0.0);
-        let baseline = -body_plan.metrics.height - gap - accent_box.metrics.depth;
+        let mut accent_box = if stretchy {
+            self.horizontal_glyph_box(glyph, body_plan.metrics.width, pixel_size)?
+        } else {
+            self.natural_glyph_box(glyph, pixel_size)?
+        };
+        // Accent outlines can sit entirely above or below their own baseline.
+        // Use signed ink extents: clamping their depth to zero adds that offset
+        // a second time and leaves hats floating far above the base.
+        let mut ink_top = f32::INFINITY;
+        let mut ink_bottom = f32::NEG_INFINITY;
+        for op in &self.glyphs[glyph_start..] {
+            let metrics = self.glyph_metrics(op.glyph_id, op.pixel_size)?;
+            ink_top = ink_top.min(op.baseline_y - metrics.height);
+            ink_bottom = ink_bottom.max(op.baseline_y + metrics.depth);
+        }
+        accent_box.metrics.height = -ink_top;
+        accent_box.metrics.depth = ink_bottom;
+        let centered = (body_plan.metrics.width - accent_box.metrics.width) * 0.5;
+        let accent_x = if !below && !stretchy {
+            let base_attachment =
+                self.top_accent_attachment(body)?.unwrap_or(body_plan.metrics.width * 0.5);
+            let op = self.glyphs[glyph_start];
+            base_attachment - op.x - self.glyph_metrics(op.glyph_id, op.pixel_size)?.top_accent
+        } else {
+            centered
+        };
+        let body_x = (-accent_x).max(0.0);
+        let x = accent_x + body_x;
+        let baseline = if below {
+            body_plan.metrics.depth
+                + self.constant(MathConstant::UnderbarVerticalGap, pixel_size)?
+                - ink_top
+        } else {
+            -body_plan
+                .metrics
+                .height
+                .max(self.constant(MathConstant::AccentBaseHeight, pixel_size)?)
+                - ink_bottom
+        };
         self.shift_glyphs(glyph_start, x, baseline);
-        self.place(body, 0.0, 0.0);
+        self.place(body, body_x, 0.0);
         let mut metrics = self.empty_metrics(index)?;
-        include_child(&mut metrics, body_plan.metrics, 0.0, 0.0);
+        include_child(&mut metrics, body_plan.metrics, body_x, 0.0);
         include_metrics(&mut metrics, accent_box.metrics, x, baseline);
-        metrics.width = metrics.width.max(body_plan.metrics.width);
         Ok(Geometry {
             metrics,
-            class: Some(AtomClass::Ord),
+            class: body_plan.class,
             italic_correction: body_plan.italic_correction,
         })
+    }
+
+    fn top_accent_attachment(&self, mut node: NodeId) -> Result<Option<f32>, MathError> {
+        let mut offset = 0.0;
+        loop {
+            let plan = self.plans[node.0 as usize];
+            if plan.rules.len != 0 || plan.text.len != 0 {
+                return Ok(None);
+            }
+            match (&self.glyphs[plan.glyphs.bounds()], &self.placements[plan.children.bounds()]) {
+                ([glyph], []) => {
+                    let metrics = self.glyph_metrics(glyph.glyph_id, glyph.pixel_size)?;
+                    return Ok(Some(offset + glyph.x + metrics.top_accent));
+                },
+                ([], [child]) => {
+                    offset += child.x;
+                    node = child.node;
+                },
+                _ => return Ok(None),
+            }
+        }
     }
 
     fn layout_matrix(
@@ -1319,6 +1419,112 @@ mod tests {
                 _ => None,
             })
             .unwrap()
+    }
+
+    fn ink_bounds(ops: impl Iterator<Item = MathGlyphOp>) -> (f32, f32, f32, f32) {
+        ops.fold(
+            (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
+            |(left, top, right, bottom), op| {
+                let ink = MathFont.glyph_metrics(GlyphId(op.glyph_id), op.pixel_size).unwrap();
+                (
+                    left.min(op.x + ink.x_min),
+                    top.min(op.baseline_y - ink.height),
+                    right.max(op.x + ink.x_max),
+                    bottom.max(op.baseline_y + ink.depth),
+                )
+            },
+        )
+    }
+
+    #[test]
+    fn hats_use_signed_ink_bounds_and_font_attachment_points() {
+        for display in [false, true] {
+            for letter in ['S', 'q', 'f'] {
+                let parsed = formula(&format!(r"\hat{{{letter}}}"), display);
+                let layout = layout_formula(&parsed, 24.0, 1.0, DEFAULT_LIMITS).unwrap();
+                assert_eq!(layout.glyphs.len(), 2);
+                let accent = layout.glyphs[0];
+                let body = layout.glyphs[1];
+                let accent_metrics =
+                    MathFont.glyph_metrics(GlyphId(accent.glyph_id), 24.0).unwrap();
+                let body_metrics = MathFont.glyph_metrics(GlyphId(body.glyph_id), 24.0).unwrap();
+                assert!(
+                    (accent.x + accent_metrics.top_accent - body.x - body_metrics.top_accent).abs()
+                        < 0.001
+                );
+                let gap = body.baseline_y
+                    - body_metrics.height
+                    - (accent.baseline_y + accent_metrics.depth);
+                assert!((-0.001..2.0).contains(&gap), "{letter}: gap={gap}");
+                assert!(layout.metrics.height < body_metrics.height + 8.0);
+            }
+        }
+    }
+
+    #[test]
+    fn underbraces_span_the_body_and_keep_labels_below_the_brace() {
+        for display in [false, true] {
+            let body =
+                layout_formula(&formula("x+y+z", display), 24.0, 1.0, DEFAULT_LIMITS).unwrap();
+            let parsed = formula(r"\underbrace{x+y+z}_{n}", display);
+            let layout = layout_formula(&parsed, 24.0, 1.0, DEFAULT_LIMITS).unwrap();
+            let brace = ink_bounds(
+                layout
+                    .glyphs
+                    .iter()
+                    .copied()
+                    .filter(|op| op.pixel_size == 24.0 && op.baseline_y > 0.0),
+            );
+            let label = ink_bounds(layout.glyphs.iter().copied().filter(|op| op.pixel_size < 24.0));
+            assert!(brace.2 - brace.0 >= body.metrics.width - 1.0);
+            assert!(brace.1 > body.metrics.depth);
+            assert!(label.1 > brace.3);
+            assert!(label.2.is_finite());
+        }
+    }
+
+    #[test]
+    fn labelled_arrows_stretch_to_the_annotation_in_both_styles() {
+        for display in [false, true] {
+            for source in [
+                r"\xrightarrow{longlabel}",
+                r"\xleftarrow[below]{longlabel}",
+                r"\xrightarrow{\text{乘密度因子}}",
+            ] {
+                let layout =
+                    layout_formula(&formula(source, display), 24.0, 1.0, DEFAULT_LIMITS).unwrap();
+                let arrow =
+                    ink_bounds(layout.glyphs.iter().copied().filter(|op| op.pixel_size == 24.0));
+                let label =
+                    ink_bounds(layout.glyphs.iter().copied().filter(|op| op.pixel_size < 24.0));
+                if layout.text.is_empty() {
+                    assert!(arrow.2 - arrow.0 >= label.2 - label.0, "{source}");
+                } else {
+                    let text_width: f32 = layout.text.iter().map(|op| op.pixel_size * 1.04).sum();
+                    assert!(arrow.2 - arrow.0 >= text_width, "{source}");
+                }
+                assert!(arrow.2 - arrow.0 > 60.0, "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_combining_accents_share_tex_geometry_before_scripts() {
+        for display in [false, true] {
+            for (unicode, tex) in [
+                ("q\u{0302}_{jc}", r"\hat{q}_{jc}"),
+                ("S\u{0302}", r"\hat{S}"),
+                ("v\u{20d7}_j", r"\vec{v}_j"),
+                ("x\u{0332}", r"\underline{x}"),
+            ] {
+                let unicode =
+                    layout_formula(&formula(unicode, display), 24.0, 1.0, DEFAULT_LIMITS).unwrap();
+                let tex =
+                    layout_formula(&formula(tex, display), 24.0, 1.0, DEFAULT_LIMITS).unwrap();
+                assert_eq!(unicode, tex);
+            }
+        }
+        assert!(parse_formula("\u{0302}_{jc}", false, DEFAULT_LIMITS).is_err());
     }
 
     #[test]

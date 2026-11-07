@@ -69,6 +69,8 @@ pub(crate) enum MathConstant {
     AccentBaseHeight,
     OverbarVerticalGap,
     OverbarRuleThickness,
+    UnderbarVerticalGap,
+    UnderbarRuleThickness,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -231,6 +233,8 @@ impl MathFont {
             MathConstant::AccentBaseHeight => constants.accent_base_height().value,
             MathConstant::OverbarVerticalGap => constants.overbar_vertical_gap().value,
             MathConstant::OverbarRuleThickness => constants.overbar_rule_thickness().value,
+            MathConstant::UnderbarVerticalGap => constants.underbar_vertical_gap().value,
+            MathConstant::UnderbarRuleThickness => constants.underbar_rule_thickness().value,
         };
         Ok(value as f32 * pixel_size / face.units_per_em() as f32)
     }

@@ -107,6 +107,27 @@ fn reject_ambiguous_row_breaks(source: &str) -> Result<(), MathError> {
     Ok(())
 }
 
+/// Combining marks in math attach to the preceding atom, including when a
+/// following script makes the upstream parser emit a pending Script first.
+/// Text runs retain their original spelling and are not rewritten as math.
+pub(crate) fn combining_accent(character: char) -> Option<(char, bool)> {
+    Some(match character {
+        '\u{0300}' => ('`', false),
+        '\u{0301}' => ('´', false),
+        '\u{0302}' => ('^', false),
+        '\u{0303}' => ('~', false),
+        '\u{0304}' | '\u{0305}' => ('‾', false),
+        '\u{0306}' => ('˘', false),
+        '\u{0307}' => ('˙', false),
+        '\u{0308}' => ('¨', false),
+        '\u{030a}' => ('˚', false),
+        '\u{030c}' => ('ˇ', false),
+        '\u{0332}' => ('_', true),
+        '\u{20d7}' => ('→', false),
+        _ => return None,
+    })
+}
+
 fn parse_normalized_formula(
     source: &str,
     display: bool,
@@ -673,11 +694,12 @@ impl Builder {
                 MathNode::Negation { body: children[0], style_override }
             },
             PendingKind::Scripts { ty, placement, style_override } => {
-                if matches!(ty, ScriptType::Superscript)
+                let below = matches!(ty, ScriptType::Subscript);
+                if !matches!(ty, ScriptType::SubSuperscript)
                     && matches!(placement, ScriptPlacement::AboveBelow)
-                    && let Some(accent) = self.single_character(children[1])
+                    && let Some((accent, stretchy)) = self.accent_character(children[1], below)
                 {
-                    MathNode::Accent { accent, body: children[0], style_override }
+                    MathNode::Accent { accent, body: children[0], below, stretchy, style_override }
                 } else {
                     let (subscript, superscript) = match ty {
                         ScriptType::Subscript => (Some(children[1]), None),
@@ -697,14 +719,39 @@ impl Builder {
         self.add_node(node)
     }
 
-    fn single_character(&self, node: NodeId) -> Option<char> {
+    fn accent_character(&self, node: NodeId, below: bool) -> Option<(char, bool)> {
         match self.arena.node(node) {
-            MathNode::Glyph { character, .. } | MathNode::Operator { character, .. } => {
-                Some(*character)
+            MathNode::Glyph { character, stretchy, class: AtomClass::Ord, .. } => {
+                let is_accent = if below {
+                    matches!(character, '_' | '⏟' | '⏝' | '⏡' | '←' | '→' | '↔')
+                } else {
+                    matches!(
+                        character,
+                        '^' | '~'
+                            | '´'
+                            | '`'
+                            | '˘'
+                            | 'ˇ'
+                            | '˙'
+                            | '¨'
+                            | '˚'
+                            | '‾'
+                            | '←'
+                            | '→'
+                            | '↔'
+                            | '↼'
+                            | '⇀'
+                            | '⇒'
+                            | '⏜'
+                            | '⏞'
+                            | '⏠'
+                    )
+                };
+                is_accent.then_some((*character, *stretchy))
             },
             MathNode::Row(range) => {
                 let [child] = self.arena.children(*range) else { return None };
-                self.single_character(*child)
+                self.accent_character(*child, below)
             },
             _ => None,
         }
@@ -805,7 +852,20 @@ impl Builder {
                 })
             },
             Content::Ordinary { content, stretchy } => {
-                self.add_glyph(content, AtomClass::Ord, state, stretchy, None)
+                if let Some((accent, below)) = combining_accent(content) {
+                    let body = self
+                        .take_accent_base()
+                        .ok_or_else(|| MathError::new(MathErrorKind::Parse, 0))?;
+                    self.add_node(MathNode::Accent {
+                        accent,
+                        body,
+                        below,
+                        stretchy: false,
+                        style_override: state.style_override,
+                    })
+                } else {
+                    self.add_glyph(content, AtomClass::Ord, state, stretchy, None)
+                }
             },
             Content::LargeOp { content, small } => self.add_node(MathNode::Operator {
                 character: content,
@@ -835,6 +895,19 @@ impl Builder {
                 self.add_glyph(character, AtomClass::Punct, state, false, None)
             },
         }
+    }
+
+    fn take_accent_base(&mut self) -> Option<NodeId> {
+        for context in self.contexts.iter_mut().rev() {
+            match context {
+                Context::Container(container) => return container.elements.pop(),
+                Context::Pending(Pending {
+                    kind: PendingKind::Scripts { .. }, children, ..
+                }) if children.is_empty() => {},
+                _ => return None,
+            }
+        }
+        None
     }
 
     fn characters_node(
@@ -1168,6 +1241,34 @@ mod tests {
             panic!()
         };
         assert_eq!(*placement, ScriptPlacement::Movable);
+    }
+
+    #[test]
+    fn accents_keep_direction_and_stretch_without_consuming_ordinary_annotations() {
+        for (source, below, stretchy) in [
+            (r"\hat{x}", false, false),
+            (r"\widehat{xy}", false, true),
+            (r"\overbrace{x+y}", false, true),
+            (r"\underbrace{x+y}", true, true),
+        ] {
+            let formula = parse(source);
+            assert!(
+                matches!(formula.arena.node(root_children(&formula)[0]),
+                MathNode::Accent { below: actual_below, stretchy: actual_stretchy, .. }
+                if *actual_below == below && *actual_stretchy == stretchy),
+                "{source}"
+            );
+        }
+        for source in [r"\overset{a}{x}", r"\xrightarrow{a}", r"\underset{n}{x}"] {
+            let formula = parse(source);
+            assert!(
+                matches!(
+                    formula.arena.node(root_children(&formula)[0]),
+                    MathNode::Scripts { placement: ScriptPlacement::AboveBelow, .. }
+                ),
+                "{source}"
+            );
+        }
     }
 
     #[test]

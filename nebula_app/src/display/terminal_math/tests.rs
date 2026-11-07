@@ -106,6 +106,36 @@ fn disabled_projection_keeps_fixed_columns() {
 }
 
 #[test]
+fn tui_projection_resets_at_padding_and_borders_and_maps_hits_back() {
+    let source = "pre $x$ + $y$ suffix  other $z$ tail│edge";
+    let grid = TextGrid::from_rows(&[source]);
+    let overlays = scan_grid_with_hints(&grid);
+    assert_eq!(overlays.len(), 3);
+    let mut state = TerminalMathState::default();
+    state.update_projection(&overlays, &[compact_prepared(2); 3], false);
+    let projection = state.projection_snapshot();
+    let field_start = source.find("other").unwrap();
+    let border = source.chars().position(|ch| ch == '│').unwrap();
+    assert_eq!(projection.shift_before(0, overlays[1].spans[0].start), -1);
+    assert_eq!(projection.shift_before(0, overlays[2].spans[0].start), 0);
+    for column in [field_start, border, border + 1] {
+        let point = Point::new(0, Column(column));
+        assert_eq!(projection.project_cell(point, 80), Some(point));
+    }
+    for column in 0..grid.columns {
+        let source = Point::new(0, Column(column));
+        if let Some(visual) = projection.project_cell(source, 80) {
+            assert_eq!(projection.source_from_visual(visual, Side::Left), (source, Side::Left));
+        }
+    }
+    let last = &overlays[2].spans[0];
+    assert_eq!(
+        projection.project_cell(Point::new(0, Column(last.end)), 80),
+        Some(Point::new(0, Column(last.start + 2)))
+    );
+}
+
+#[test]
 fn compact_projection_discards_overlapping_streaming_candidate() {
     let grid = TextGrid::from_rows(&["pre $x^2$ suffix"]);
     let outer = scan_grid(&grid).remove(0);
@@ -861,6 +891,16 @@ fn bare_parens_reject_regex_prose_and_single_letter_escapes() {
 /// 原文。它们不是理论候选：`HOME`、`npm install`、`PATH=/tmp` 在
 /// pulldown-latex 里都能成功解析成公式事件，判定放过就是真替换。
 #[test]
+fn numeric_subscripts_on_uppercase_variables_are_math() {
+    for source in [r"\(R_0\)", "$R_0$", "$X_12$", "$$R_0$$"] {
+        assert_eq!(sources(&[source]).len(), 1, "{source}");
+    }
+    for source in ["$HOME$", "$LONG_VARIABLE$", "$FOO_1$", "$R_HOME$"] {
+        assert!(sources(&[source]).is_empty(), "{source}");
+    }
+}
+
+#[test]
 fn explicit_delimiters_still_require_content_evidence() {
     assert!(sources(&[r"escaped \$x$"]).is_empty());
     // 成对美元定界符明确表示数字公式；真实金额使用单个美元符号，仍保持原文。
@@ -1050,6 +1090,16 @@ fn single_dollar_uses_the_standard_formula_rule_without_agent_context() {
 }
 
 #[test]
+fn unicode_accents_inside_math_delimiters_are_not_left_literal() {
+    for source in ["q\u{0302}", "q\u{0302}_{jc}", "ŝ_{jc}=q\u{0302}_{jc}Δ V_j"] {
+        let delimited = format!("${source}$");
+        assert_eq!(sources(&[&delimited]), vec![(source.into(), false)]);
+    }
+    assert!(sources(&["q\u{0302}_{jc}"]).is_empty(), "plain terminal text needs math delimiters");
+    assert!(sources(&["$foo\u{0302}$"]).is_empty(), "an accent does not turn a word into math");
+}
+
+#[test]
 fn persisted_formula_survives_partial_scroll_without_rescaling_its_bounds() {
     let mut state = TerminalMathState::default();
     let initial = grid_at(&["$$   ", "x^2  ", "$$   ", "tail "], 40, 0);
@@ -1065,6 +1115,39 @@ fn persisted_formula_survives_partial_scroll_without_rescaling_its_bounds() {
     assert_eq!(overlays[0].source.as_ref(), "x^2");
     assert_eq!(overlays[0].spans.first().map(|span| span.row), Some(-1));
     assert_eq!(overlays[0].spans.last().map(|span| span.row), Some(1));
+}
+
+#[test]
+fn partial_scroll_does_not_reinterpret_a_cached_display_closer() {
+    let mut state = TerminalMathState::default();
+    let rows = ["$$   ", "x^2  ", "$$   ", "a=b  ", "$$   ", "y^2  ", "$$   "];
+    let initial = grid_at(&rows, 40, 0);
+    remember_visible(&mut state, &initial);
+
+    for offset in [1, 2] {
+        let scrolled = grid_at(&rows[offset..], 40 + offset, 0);
+        state.synchronize_grid(&scrolled);
+        state.scan_visible_grid(&scrolled, None);
+        let overlays = state.visible_overlays(&scrolled);
+        assert_eq!(
+            overlays.iter().map(|overlay| overlay.source.as_ref()).collect::<Vec<_>>(),
+            ["x^2", "y^2"],
+            "the clipped closer must not pair with the next formula's opener"
+        );
+        assert_eq!(overlays[0].spans[0].row, -(offset as i32));
+    }
+}
+
+#[test]
+fn changed_partial_formula_does_not_hide_new_formulas() {
+    let mut state = TerminalMathState::default();
+    remember_visible(&mut state, &grid_at(&["$$   ", "x^2  ", "$$   "], 40, 0));
+    let changed = grid_at(&["$z$  ", "tail "], 41, 0);
+    state.synchronize_grid(&changed);
+    state.scan_visible_grid(&changed, None);
+    let overlays = state.visible_overlays(&changed);
+    assert_eq!(overlays.len(), 1);
+    assert_eq!(overlays[0].source.as_ref(), "z");
 }
 
 #[test]
@@ -1723,6 +1806,7 @@ fn image_projection_preserves_erased_tiles_row_offsets_and_clipping() {
             source_start: 0,
             source_end: 6,
             visual_cells: 4,
+            reflow_end: usize::MAX,
             shift_before: 0,
             shift_after: -2,
         }],
@@ -1786,6 +1870,7 @@ fn expanded_formula_clips_image_without_changing_texture_origin() {
             source_start: 0,
             source_end: 3,
             visual_cells: 6,
+            reflow_end: usize::MAX,
             shift_before: 0,
             shift_after: 3,
         }],

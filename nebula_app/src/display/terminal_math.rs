@@ -166,12 +166,7 @@ impl TerminalMathState {
         prepared: &[Option<PreparedFormula>],
         reflow_inline: bool,
     ) -> Vec<bool> {
-        if reflow_inline {
-            self.projection.rebuild(overlays, prepared)
-        } else {
-            self.projection.spans.clear();
-            vec![true; overlays.len()]
-        }
+        self.projection.rebuild(overlays, prepared, reflow_inline)
     }
 
     pub(crate) fn project_cell(&self, point: Point<usize>, columns: usize) -> Option<Point<usize>> {
@@ -245,7 +240,24 @@ impl TerminalMathState {
         let scan = match &self.last_scan {
             Some((previous, scan)) if previous == grid => scan.clone(),
             _ => {
-                let scan = scan_grid_result(grid);
+                // A cached formula may start above the viewport. Its visible
+                // tail still belongs to that formula: treating its closer as
+                // a new opener can replace both it and the next formula.
+                let start = self
+                    .formulas
+                    .range(..FormulaAnchor { row: grid.absolute_top, column: 0 })
+                    .next_back()
+                    .map(|(_, formula)| formula)
+                    .filter(|formula| {
+                        formula.last_row() >= grid.absolute_top
+                            && formula.matches_visible_rows(grid)
+                    })
+                    .and_then(|formula| formula.spans.last())
+                    .map_or(GridPosition { row: 0, column: 0 }, |span| GridPosition {
+                        row: span.row - grid.absolute_top,
+                        column: span.end,
+                    });
+                let scan = scan_grid_from(grid, start);
                 self.last_scan = Some((grid.clone(), scan.clone()));
                 scan
             },
@@ -621,6 +633,7 @@ impl PersistedFormula {
             formula_neighbours_above: [false; MAX_ABSORBED_BLANK_ROWS],
             formula_neighbours_below: [false; MAX_ABSORBED_BLANK_ROWS],
             widen_right_to: None,
+            inline_reflow_end: None,
         }
     }
 }
@@ -690,6 +703,9 @@ pub(crate) struct FormulaOverlay {
     /// Right edge (in grid columns) available to a display formula whose rows
     /// hold nothing after the source.
     widen_right_to: Option<usize>,
+    /// End of the following text run. Fixed-grid TUIs may compact this run,
+    /// but column padding, borders, images and ANSI surfaces stay anchored.
+    inline_reflow_end: Option<usize>,
 }
 
 impl FormulaOverlay {
@@ -826,6 +842,7 @@ struct ProjectionSpan {
     source_start: usize,
     source_end: usize,
     visual_cells: usize,
+    reflow_end: usize,
     shift_before: isize,
     shift_after: isize,
 }
@@ -876,6 +893,7 @@ impl LineProjection {
         &mut self,
         overlays: &[FormulaOverlay],
         prepared: &[Option<PreparedFormula>],
+        reflow_inline: bool,
     ) -> Vec<bool> {
         self.spans.clear();
         let mut retained = vec![true; overlays.len()];
@@ -888,15 +906,21 @@ impl LineProjection {
             };
             let [span] = overlay.spans.as_slice() else { continue };
             let Ok(row) = usize::try_from(span.row) else { continue };
-            if span.end <= span.start {
+            if span.end <= span.start || (!reflow_inline && visual_cells > span.end - span.start) {
                 continue;
             }
+            let reflow_end = if reflow_inline {
+                usize::MAX
+            } else {
+                overlay.inline_reflow_end.unwrap_or(span.end)
+            };
             self.spans.push(ProjectionSpan {
                 source_index,
                 row,
                 source_start: span.start,
                 source_end: span.end,
                 visual_cells,
+                reflow_end,
                 shift_before: 0,
                 shift_after: 0,
             });
@@ -928,8 +952,9 @@ impl LineProjection {
 
         let mut row = None;
         let mut shift = 0isize;
+        let mut reflow_end = 0;
         for span in &mut self.spans {
-            if row != Some(span.row) {
+            if row != Some(span.row) || span.source_start >= reflow_end {
                 row = Some(span.row);
                 shift = 0;
             }
@@ -937,6 +962,7 @@ impl LineProjection {
             let source_cells = span.source_end - span.source_start;
             shift = shift.saturating_add(span.visual_cells as isize - source_cells as isize);
             span.shift_after = shift;
+            reflow_end = span.reflow_end;
         }
         retained
     }
@@ -944,7 +970,7 @@ impl LineProjection {
     #[cfg(test)]
     fn build(overlays: &[FormulaOverlay], prepared: &[Option<PreparedFormula>]) -> Self {
         let mut projection = Self::default();
-        let _ = projection.rebuild(overlays, prepared);
+        let _ = projection.rebuild(overlays, prepared, true);
         projection
     }
 
@@ -959,6 +985,7 @@ impl LineProjection {
             .iter()
             .take_while(|span| span.source_end <= source_column)
             .last()
+            .filter(|span| source_column < span.reflow_end)
             .map_or(0, |span| span.shift_after)
     }
 
@@ -967,8 +994,8 @@ impl LineProjection {
         let preceding = spans.partition_point(|span| span.source_start <= point.column.0);
         let shift = match preceding.checked_sub(1).and_then(|index| spans.get(index)) {
             Some(span) if point.column.0 < span.source_end => return None,
-            Some(span) => span.shift_after,
-            None => 0,
+            Some(span) if point.column.0 < span.reflow_end => span.shift_after,
+            _ => 0,
         };
         let column = apply_shift(point.column.0, shift);
         (column < columns).then(|| Point::new(point.line, Column(column)))
@@ -1002,8 +1029,12 @@ impl LineProjection {
         let spans = self.row_spans(point.line);
         let visual_column = point.column.0;
         let mut shift = 0isize;
+        let mut reflow_end = 0;
 
         for span in spans {
+            if visual_column >= reflow_end {
+                shift = 0;
+            }
             let visual_start = apply_shift(span.source_start, span.shift_before);
             let visual_end = visual_start.saturating_add(span.visual_cells);
             if visual_column < visual_start {
@@ -1020,9 +1051,15 @@ impl LineProjection {
                 };
             }
             shift = span.shift_after;
+            reflow_end = span.reflow_end;
         }
 
-        let source_column = apply_shift(visual_column, shift.saturating_neg());
+        if visual_column >= reflow_end {
+            return (point, side);
+        }
+        // The space released at a fixed-grid boundary maps to that boundary,
+        // rather than into a neighboring column or sidebar.
+        let source_column = apply_shift(visual_column, shift.saturating_neg()).min(reflow_end);
         (Point::new(point.line, Column(source_column)), side)
     }
 }

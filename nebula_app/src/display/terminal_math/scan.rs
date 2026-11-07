@@ -401,6 +401,19 @@ impl TextGrid {
             .is_some_and(|cells| cells.contains(&Some(OBJECT)))
     }
 
+    fn inline_reflow_end(&self, span: &RowSpan) -> Option<usize> {
+        let cells = self.rows.get(usize::try_from(span.row).ok()?)?;
+        for column in span.end..cells.len() {
+            let cell = cells[column];
+            let padding = cell == Some(' ') && cells.get(column + 1) == Some(&Some(' '));
+            if padding || matches!(cell, Some(OBJECT | '|' | '│' | '┃' | '║' | '┆' | '┊'))
+            {
+                return Some(column);
+            }
+        }
+        Some(cells.len())
+    }
+
     pub(super) fn spans(&self, start: GridPosition, end: GridPosition) -> Vec<RowSpan> {
         if start.row == end.row {
             return vec![RowSpan { row: start.row as i32, start: start.column, end: end.column }];
@@ -508,6 +521,20 @@ pub(crate) fn scan_visible<T>(
             }
 
             apply_layout_hints(&mut overlay, &grid);
+            if let (Some(end), [span]) = (overlay.inline_reflow_end, overlay.spans.as_slice()) {
+                overlay.inline_reflow_end = Some(
+                    rendered_cells
+                        .iter()
+                        .filter(|cell| {
+                            usize::try_from(span.row) == Ok(cell.point.line)
+                                && (span.end..end).contains(&cell.point.column.0)
+                                && cell.bg_alpha > 0.0
+                        })
+                        .map(|cell| cell.point.column.0)
+                        .min()
+                        .unwrap_or(end),
+                );
+            }
             Some(overlay)
         })
         .collect();
@@ -542,6 +569,11 @@ pub(super) fn apply_layout_hints(overlay: &mut FormulaOverlay, grid: &TextGrid) 
     // much of it is actually in the way once it knows the rendered width.
     let (Some(first), Some(last)) = (overlay.spans.first(), overlay.spans.last()) else {
         return;
+    };
+    overlay.inline_reflow_end = if !overlay.display && overlay.spans.len() == 1 {
+        grid.inline_reflow_end(first)
+    } else {
+        None
     };
     overlay.neighbours_above = neighbour_rows(grid, first.row, -1, overlay.display);
     overlay.neighbours_below = neighbour_rows(grid, last.row, 1, overlay.display);
@@ -646,9 +678,12 @@ pub(super) struct GridScanResult {
 }
 
 pub(super) fn scan_grid_result(grid: &TextGrid) -> GridScanResult {
+    scan_grid_from(grid, GridPosition { row: 0, column: 0 })
+}
+
+pub(super) fn scan_grid_from(grid: &TextGrid, mut position: GridPosition) -> GridScanResult {
     let mut overlays = Vec::new();
     let mut unmatched_display = None;
-    let mut position = GridPosition { row: 0, column: 0 };
     // 只有裸定界符消费它：其余四类各自有 O(1) 前置闸。
     let mut bare_budget = BARE_SEARCH_CELL_BUDGET;
 
@@ -1282,7 +1317,15 @@ pub(super) fn obviously_non_math(source: &str) -> bool {
     let shell_identifier = source.chars().all(|character| {
         character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
     });
-    currency || (shell_identifier && source.chars().count() > 1)
+    // A single capital with a numeric subscript is a standard variable,
+    // e.g. R_0. Multi-letter environment names still stay literal.
+    let numeric_subscript = source.split_once('_').is_some_and(|(base, index)| {
+        base.len() == 1
+            && base.bytes().all(|byte| byte.is_ascii_uppercase())
+            && !index.is_empty()
+            && index.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    currency || (shell_identifier && source.chars().count() > 1 && !numeric_subscript)
 }
 
 /// At least one structural sign of mathematics. `lax` (display blocks) lifts
@@ -1290,7 +1333,10 @@ pub(super) fn obviously_non_math(source: &str) -> bool {
 /// `mc^2` qualify; inline keeps it so `$foo^bar$` stays literal text.
 pub(super) fn has_math_evidence(source: &str, lax: bool) -> bool {
     let chars: Vec<_> = source.chars().collect();
-    let single_variable = chars.len() == 1 && chars[0].is_alphabetic();
+    let single_variable = chars.first().is_some_and(|character| character.is_alphabetic())
+        && chars[1..]
+            .iter()
+            .all(|&character| crate::math::parser::combining_accent(character).is_some());
     let tex_command = chars.windows(2).any(|pair| pair[0] == '\\' && pair[1].is_alphabetic());
     let script = source.find(['^', '_']).is_some_and(|index| {
         let (base, suffix) = source.split_at(index);
@@ -1381,7 +1427,9 @@ pub(super) fn explicit_operand(operand: &str) -> bool {
     let alphabetic = operand.chars().filter(|character| character.is_alphabetic()).count();
     alphabetic <= 1
         && operand.chars().all(|character| {
-            character.is_alphanumeric() || matches!(character, '.' | ',' | '\\' | '^' | '_')
+            character.is_alphanumeric()
+                || matches!(character, '.' | ',' | '\\' | '^' | '_')
+                || crate::math::parser::combining_accent(character).is_some()
         })
 }
 
@@ -1462,5 +1510,6 @@ pub(super) fn make_overlay(
         formula_neighbours_above: [false; MAX_ABSORBED_BLANK_ROWS],
         formula_neighbours_below: [false; MAX_ABSORBED_BLANK_ROWS],
         widen_right_to: None,
+        inline_reflow_end: None,
     }
 }

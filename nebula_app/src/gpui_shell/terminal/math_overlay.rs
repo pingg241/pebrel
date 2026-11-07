@@ -292,7 +292,7 @@ impl MathOverlay {
             candidates,
             size: *size,
             pixels_per_point,
-            // 与旧壳一致：TUI/备用屏继续拥有固定列坐标，但公式覆盖本身仍可用。
+            // TUI/备用屏仅收紧当前文本段；列间留白和分隔线之后仍使用固定列。
             reflow_inline: !alt_screen,
             selection,
             viewport_origin: origin,
@@ -655,6 +655,40 @@ mod tests {
     }
 
     #[test]
+    fn partially_scrolled_formulas_keep_their_draw_plan_and_source_coverage() {
+        use nebula_terminal::event_loop::StreamProcessor;
+        use nebula_terminal::grid::Scroll;
+
+        let mut term = Term::new(Config::default(), &TestSize { cols: 32, rows: 8 }, VoidListener);
+        StreamProcessor::default().feed(
+            &mut term,
+            &VoidListener,
+            b"$$\r\nx^2\r\n$$\r\na=b\r\n$$\r\ny^2\r\n$$\r\n\r\n\r\nprompt",
+        );
+        term.scroll_display(Scroll::Top);
+        let mut overlay = MathOverlay::default();
+        let initial = plan(&mut overlay, &term, 32, 8);
+        assert_eq!(initial.formulas.len(), 2);
+        let original = initial.formulas[0].plan;
+
+        for offset in [1, 2] {
+            term.scroll_display(Scroll::Delta(-1));
+            for _ in 0..2 {
+                let frame = plan(&mut overlay, &term, 32, 8);
+                assert_eq!(frame.formulas.len(), 2);
+                assert_eq!(frame.formulas[0].source.as_ref(), "x^2");
+                assert_eq!(frame.formulas[1].source.as_ref(), "y^2");
+                assert!(frame.covers(0, 0), "the visible formula tail must hide its source");
+                assert!(!frame.covers(3 - offset, 0), "intervening prose must stay literal");
+                let clipped = frame.formulas[0].plan;
+                assert_eq!(clipped.fitted_pixel_size, original.fitted_pixel_size);
+                assert_eq!(clipped.baseline_y, original.baseline_y - offset as f32 * 16.0);
+                assert_eq!(clipped.clip_top, 0.0);
+            }
+        }
+    }
+
+    #[test]
     fn native_source_filter_excludes_hidden_formulas_and_keeps_visible_tail() {
         let term = term_with(24, 8, &[r"$x_1$", "", r"$y_2$", "", r"$z_3$"]);
         let size = grid_size_info(24, 8, 8.0, 16.0);
@@ -749,6 +783,26 @@ mod tests {
             cells.iter().filter(|cell| cell.point.line == 0).map(|cell| cell.character).collect();
         assert_eq!(row0, r"\[x\]");
         assert!(cells.iter().all(|cell| cell.bg_alpha == 0.0));
+    }
+
+    #[test]
+    fn reported_codex_display_sources_reach_native_formula_plans() {
+        // Original display-math bodies from the reported Codex conversation.
+        // The terminal Markdown renderer can remove the delimiter backslashes.
+        for source in [
+            r"\widehat S_{jc}=\widehat q_{jc}\Delta V_j",
+            r"\text{offset}=\frac{0.75-0.55}{0.20}=1",
+        ] {
+            for (open, close) in [(r"\[", r"\]"), ("[", "]")] {
+                let term = term_with(80, 8, &[open, source, close, "", "prompt"]);
+                let frame = plan(&mut MathOverlay::default(), &term, 80, 8);
+                assert_eq!(frame.formulas.len(), 1, "{source}");
+                assert_eq!(frame.formulas[0].source.as_ref(), source);
+                assert!(frame.formulas[0].plan.display_style);
+                assert!(frame.covers(1, 0));
+                assert!(!frame.covers(4, 0));
+            }
+        }
     }
 
     #[test]
@@ -963,6 +1017,78 @@ mod tests {
 
         assert!(cleared.is_empty());
         assert_eq!(cleared.project_cell(0, source_suffix, 20), Some(source_suffix));
+    }
+
+    #[test]
+    fn alt_screen_math_closes_delimiter_gaps_without_moving_table_columns() {
+        use nebula_terminal::event_loop::StreamProcessor;
+        for variable in ["a", "R_0", "r"] {
+            let mut term =
+                Term::new(Config::default(), &TestSize { cols: 96, rows: 6 }, VoidListener);
+            term.swap_alt();
+            let source =
+                format!(r"      \({variable}\)，小半径          从磁轴到边界          0.65 m");
+            StreamProcessor::default().feed(
+                &mut term,
+                &VoidListener,
+                format!("{source}\r\n\r\nprompt").as_bytes(),
+            );
+            let comma = (0..96).find(|&col| term.grid()[Line(0)][Column(col)].c == '，').unwrap();
+            let next_column =
+                (0..96).find(|&col| term.grid()[Line(0)][Column(col)].c == '从').unwrap();
+            let mut overlay = MathOverlay::default();
+            let frame = plan(&mut overlay, &term, 96, 6);
+            assert_eq!(frame.formulas.len(), 1, "{variable}");
+            let visual_comma = frame.project_cell(0, comma, 96).unwrap();
+            assert_eq!(
+                visual_comma as f32 * 8.0,
+                frame.formulas[0].plan.clip_right,
+                "punctuation must follow the compact formula without a delimiter-sized gap"
+            );
+            assert_eq!(frame.project_cell(0, next_column, 96), Some(next_column));
+            for col in comma..next_column {
+                if term.grid()[Line(0)][Column(col)]
+                    .flags
+                    .contains(nebula_terminal::term::cell::Flags::WIDE_CHAR_SPACER)
+                {
+                    assert_eq!(
+                        frame.project_cell(0, col, 96),
+                        frame.project_cell(0, col - 1, 96).map(|col| col + 1)
+                    );
+                }
+            }
+            assert_eq!(
+                overlay.source_point(
+                    Point::new(Line(0), Column(visual_comma)),
+                    Side::Left,
+                    Line(0)
+                ),
+                (Point::new(Line(0), Column(comma)), Side::Left)
+            );
+            assert_eq!(
+                overlay.source_point(Point::new(Line(0), Column(next_column)), Side::Left, Line(0)),
+                (Point::new(Line(0), Column(next_column)), Side::Left)
+            );
+        }
+    }
+
+    #[test]
+    fn alt_screen_inline_spacing_stops_before_ansi_surfaces() {
+        use nebula_terminal::event_loop::StreamProcessor;
+        let mut term = Term::new(Config::default(), &TestSize { cols: 40, rows: 4 }, VoidListener);
+        term.swap_alt();
+        StreamProcessor::default().feed(
+            &mut term,
+            &VoidListener,
+            b"\\(a\\), left \x1b[44msidebar\x1b[0m\r\n\r\nprompt",
+        );
+        let mut overlay = MathOverlay::default();
+        let frame = plan(&mut overlay, &term, 40, 4);
+        assert_eq!(frame.formulas.len(), 1);
+        assert!(frame.project_cell(0, 5, 40).unwrap() < 5);
+        for column in 12..19 {
+            assert_eq!(frame.project_cell(0, column, 40), Some(column));
+        }
     }
 
     #[test]
