@@ -244,24 +244,36 @@ impl TerminalMathState {
         let scan = match &self.last_scan {
             Some((previous, scan)) if previous == grid => scan.clone(),
             _ => {
-                // A cached formula may start above the viewport. Its visible
-                // tail still belongs to that formula: treating its closer as
-                // a new opener can replace both it and the next formula.
-                let start = self
+                // Both clipped tails and clipped heads still belong to the
+                // verified complete formula. Re-scanning their inner TeX can
+                // replace it with a small nested candidate such as (\mathbf r).
+                let top = grid.absolute_top as i64;
+                let bottom = top + grid.rows.len() as i64;
+                let content_top = grid.tui_clip.map_or(top, |clip| clip.top);
+                let content_bottom = grid.tui_clip.map_or(bottom, |clip| clip.bottom);
+                let lower = FormulaAnchor { row: top - self.max_formula_rows as i64, column: 0 };
+                let upper = FormulaAnchor { row: bottom, column: 0 };
+                let protected: Vec<_> = self
                     .formulas
-                    .range(..FormulaAnchor { row: grid.absolute_top as i64, column: 0 })
-                    .next_back()
+                    .range(lower..upper)
                     .map(|(_, formula)| formula)
                     .filter(|formula| {
-                        formula.last_row() >= grid.absolute_top as i64
+                        (formula.anchor.row < content_top || formula.last_row() >= content_bottom)
                             && formula.matches_visible_rows(grid)
                     })
-                    .and_then(|formula| formula.spans.last())
-                    .map_or(GridPosition { row: 0, column: 0 }, |span| GridPosition {
-                        row: (span.row - grid.absolute_top as i64) as usize,
-                        column: span.end,
-                    });
-                let scan = scan_grid_from(grid, start);
+                    .filter_map(|formula| {
+                        let first = formula.spans.first()?;
+                        let last = formula.spans.last()?;
+                        Some((
+                            GridPosition {
+                                row: (first.row - top).max(0) as usize,
+                                column: if first.row < top { 0 } else { first.start },
+                            },
+                            GridPosition { row: (last.row - top) as usize, column: last.end },
+                        ))
+                    })
+                    .collect();
+                let scan = scan_grid_excluding(grid, &protected);
                 self.last_scan = Some((grid.clone(), scan.clone()));
                 scan
             },
@@ -531,6 +543,7 @@ struct PersistedFormula {
     display: bool,
     formula_id: u64,
     spans: Box<[PersistedRowSpan]>,
+    clip: Option<redraw::TuiClip>,
     charge: usize,
 }
 
@@ -549,6 +562,7 @@ impl PersistedFormula {
                 include_wrap,
             });
         }
+        let clip = grid.tui_clip.filter(|clip| spans.iter().all(|span| clip.contains(span.row)));
         let first = spans.first()?;
         let anchor = FormulaAnchor { row: first.row, column: first.start };
         let charge = size_of::<Self>()
@@ -560,6 +574,7 @@ impl PersistedFormula {
             display: overlay.display,
             formula_id: overlay.formula_id,
             spans: spans.into_boxed_slice(),
+            clip,
             charge,
         })
     }
@@ -573,12 +588,17 @@ impl PersistedFormula {
             && self.formula_id == other.formula_id
             && self.source == other.source
             && self.spans == other.spans
+            && self.clip == other.clip
     }
 
     fn overlaps(&self, other: &Self) -> bool {
         self.spans.iter().any(|left| {
             other.spans.iter().any(|right| {
-                left.row == right.row && left.start < right.end && right.start < left.end
+                left.row == right.row
+                    && left.start < right.end
+                    && right.start < left.end
+                    && self.clip.is_none_or(|clip| clip.contains(left.row))
+                    && other.clip.is_none_or(|clip| clip.contains(right.row))
             })
         })
     }
@@ -592,12 +612,15 @@ impl PersistedFormula {
     }
 
     fn matches_visible_rows(&self, grid: &TextGrid) -> bool {
+        if self.clip.is_some_and(|clip| !clip.matches(grid)) {
+            return false;
+        }
         let mut compared = false;
         for span in &self.spans {
             let Ok(row) = usize::try_from(span.row - grid.absolute_top as i64) else {
                 continue;
             };
-            if row >= grid.rows.len() {
+            if row >= grid.rows.len() || self.clip.is_some_and(|clip| !clip.contains(span.row)) {
                 continue;
             }
             if grid.span_fingerprint(row, span.start, span.end, span.include_wrap)
@@ -640,6 +663,12 @@ impl PersistedFormula {
             formula_neighbours_below: [false; MAX_ABSORBED_BLANK_ROWS],
             widen_right_to: None,
             inline_reflow_end: None,
+            clip_rows: self.clip.map(|clip| {
+                (
+                    (clip.top - absolute_top as i64).max(0) as usize,
+                    (clip.bottom - absolute_top as i64).max(0) as usize,
+                )
+            }),
         }
     }
 }
@@ -708,6 +737,8 @@ pub(crate) struct FormulaOverlay {
     /// End of the following text run. Fixed-grid TUIs may compact this run,
     /// but column padding, borders, images and ANSI surfaces stay anchored.
     inline_reflow_end: Option<usize>,
+    /// Verified TUI content rows; source bounds remain complete for layout.
+    clip_rows: Option<(usize, usize)>,
 }
 
 impl FormulaOverlay {
@@ -724,22 +755,30 @@ impl FormulaOverlay {
     /// 掩码，因此这里把跨度交出去，而不是让它去猜 `spans` 的内部表示。
     pub(crate) fn covered_spans(&self) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
         self.spans.iter().filter_map(|span| {
-            usize::try_from(span.row).ok().map(|row| (row, span.start, span.end))
+            usize::try_from(span.row)
+                .ok()
+                .filter(|&row| self.visible_row(row))
+                .map(|row| (row, span.start, span.end))
         })
     }
 
+    fn visible_row(&self, row: usize) -> bool {
+        self.clip_rows.is_none_or(|(top, bottom)| (top..bottom).contains(&row))
+    }
+
     fn contains(&self, point: Point<usize>) -> bool {
-        self.spans.iter().any(|span| {
-            usize::try_from(span.row) == Ok(point.line)
-                && (span.start..span.end).contains(&point.column.0)
-        })
+        self.visible_row(point.line)
+            && self.spans.iter().any(|span| {
+                usize::try_from(span.row) == Ok(point.line)
+                    && (span.start..span.end).contains(&point.column.0)
+            })
     }
 
     fn intersects_rows(&self, rows: &std::ops::RangeInclusive<usize>) -> bool {
         self.spans
             .iter()
             .filter_map(|span| usize::try_from(span.row).ok())
-            .any(|row| rows.contains(&row))
+            .any(|row| self.visible_row(row) && rows.contains(&row))
     }
 
     fn bounds(&self, size: &SizeInfo) -> Option<FormulaBounds> {
@@ -1394,9 +1433,17 @@ pub(crate) fn plan_overlay_draw(
     // prose. (Following the ink is what painted formulas over adjacent
     // rows.)
     let clip_left = bounds.left.max(size.padding_x());
-    let clip_top = (bounds.top - prepared.bleed_top).max(size.padding_y());
+    let (content_top, content_bottom) =
+        overlay.clip_rows.map_or((size.padding_y(), viewport_bottom), |(top, bottom)| {
+            (
+                size.padding_y() + top as f32 * size.cell_height(),
+                size.padding_y() + bottom as f32 * size.cell_height(),
+            )
+        });
+    let clip_top = (bounds.top - prepared.bleed_top).max(size.padding_y()).max(content_top);
     let clip_right = box_right.min(viewport_right);
-    let clip_bottom = (bounds.bottom + prepared.bleed_bottom).min(viewport_bottom);
+    let clip_bottom =
+        (bounds.bottom + prepared.bleed_bottom).min(viewport_bottom).min(content_bottom);
     if clip_right <= clip_left || clip_bottom <= clip_top {
         return None;
     }

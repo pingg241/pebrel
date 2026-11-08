@@ -748,6 +748,68 @@ mod tests {
     }
 
     #[test]
+    fn tui_formula_scroll_clips_at_fixed_header_and_footer() {
+        use nebula_terminal::event_loop::StreamProcessor;
+        let mut term = Term::new(Config::default(), &TestSize { cols: 80, rows: 13 }, VoidListener);
+        let mut stream = StreamProcessor::default();
+        stream.feed(&mut term, &VoidListener, b"\x1b[?1049h");
+        let document = [
+            "",
+            "weight:",
+            r"\[",
+            r"W=\widehat S",
+            r"\frac{b_c(\mathbf r)\sigma(K)v_{\rm rel}}",
+            r"{\widehat q_{jc}}",
+            r"\]",
+            "after",
+            "more",
+            "next",
+        ];
+        let mut overlay = MathOverlay::default();
+        let mut initial = None;
+        for shift in [0, 1, 2, 3, 4, 5, 4, 0, -1, -2, -3, 0] {
+            let mut rows = vec!["PINNED QUESTION".to_owned()];
+            for row in 1..10 {
+                let index = row - 1 - shift;
+                rows.push(if index < 0 {
+                    format!("earlier {index}")
+                } else {
+                    document.get(index as usize).unwrap_or(&"").to_string()
+                });
+            }
+            rows.extend([
+                "\x1b[44mBack to bottom\x1b[0m".into(),
+                "> input".into(),
+                "status".into(),
+            ]);
+            let text = format!("\x1b[H\x1b[2J{}\x1b[12;1H", rows.join("\r\n"));
+            stream.feed(&mut term, &VoidListener, text.as_bytes());
+            for _ in 0..2 {
+                let frame = plan(&mut overlay, &term, 80, 13);
+                assert_eq!(frame.formulas.len(), 1, "shift {shift}");
+                let formula = &frame.formulas[0];
+                assert_eq!(
+                    formula.source.split_whitespace().collect::<Vec<_>>().join(" "),
+                    document[3..6].join(" ")
+                );
+                let baseline = initial.get_or_insert(formula.plan.baseline_y);
+                assert!(
+                    (formula.plan.baseline_y - (*baseline + shift as f32 * 16.0)).abs() < 0.001,
+                    "shift={shift}, baseline={}, initial={}, source={}",
+                    formula.plan.baseline_y,
+                    baseline,
+                    formula.source
+                );
+                assert!(formula.plan.clip_top >= 16.0, "pinned question must not be painted over");
+                assert!(formula.plan.clip_bottom <= 160.0, "footer must not be painted over");
+                for row in [0, 10, 11, 12] {
+                    assert!(!frame.covers(row, 0), "fixed UI source must stay visible at {row}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn native_source_filter_excludes_hidden_formulas_and_keeps_visible_tail() {
         let term = term_with(24, 8, &[r"$x_1$", "", r"$y_2$", "", r"$z_3$"]);
         let size = grid_size_info(24, 8, 8.0, 16.0);

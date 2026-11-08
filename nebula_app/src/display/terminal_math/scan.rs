@@ -12,6 +12,7 @@ pub(super) struct TextGrid {
     pub(super) columns: usize,
     pub(super) absolute_top: usize,
     pub(super) scrolled_out: usize,
+    pub(super) tui_clip: Option<redraw::TuiClip>,
 }
 
 impl TextGrid {
@@ -65,7 +66,7 @@ impl TextGrid {
             wrapped.push(is_wrapped);
         }
 
-        Self { rows, wrapped, columns, absolute_top, scrolled_out }
+        Self { rows, wrapped, columns, absolute_top, scrolled_out, tui_clip: None }
     }
 
     #[cfg(test)]
@@ -80,7 +81,7 @@ impl TextGrid {
             })
             .collect::<Vec<_>>();
         let wrapped = vec![false; rows.len()];
-        Self { rows, wrapped, columns, absolute_top: 0, scrolled_out: 0 }
+        Self { rows, wrapped, columns, absolute_top: 0, scrolled_out: 0, tui_clip: None }
     }
 
     pub(super) fn character(&self, position: GridPosition) -> Option<char> {
@@ -453,7 +454,7 @@ pub(crate) fn scan_visible<T>(
     default_foreground: Rgb,
     include: impl Fn(usize) -> bool,
 ) -> Vec<FormulaOverlay> {
-    let grid = TextGrid::from_term(terminal, size, 0, &include);
+    let mut grid = TextGrid::from_term(terminal, size, 0, &include);
     let active_edit_rows = cursor.and_then(|cursor| grid.logical_rows_containing(cursor.line));
     let alternate_screen = terminal.mode().contains(nebula_terminal::term::TermMode::ALT_SCREEN);
     if state.alternate_screen != alternate_screen {
@@ -468,7 +469,7 @@ pub(crate) fn scan_visible<T>(
         if grid.rows.iter().flatten().all(|cell| cell.is_none_or(|ch| ch == ' ')) {
             return Vec::new();
         }
-        state.relocate_tui_formulas(&grid);
+        state.relocate_tui_formulas(&mut grid);
     }
     let history_anchor = state.scan_visible_grid(&grid, active_edit_rows.as_ref());
     if let Some(anchor) = history_anchor.filter(|_| !alternate_screen) {
@@ -693,16 +694,26 @@ pub(super) struct GridScanResult {
 }
 
 pub(super) fn scan_grid_result(grid: &TextGrid) -> GridScanResult {
-    scan_grid_from(grid, GridPosition { row: 0, column: 0 })
+    scan_grid_excluding(grid, &[])
 }
 
-pub(super) fn scan_grid_from(grid: &TextGrid, mut position: GridPosition) -> GridScanResult {
+pub(super) fn scan_grid_excluding(
+    grid: &TextGrid,
+    protected: &[(GridPosition, GridPosition)],
+) -> GridScanResult {
+    let mut position = GridPosition { row: 0, column: 0 };
     let mut overlays = Vec::new();
     let mut unmatched_display = None;
     // 只有裸定界符消费它：其余四类各自有 O(1) 前置闸。
     let mut bare_budget = BARE_SEARCH_CELL_BUDGET;
 
     while position.row < grid.rows.len() && overlays.len() < MAX_VISIBLE_FORMULAS {
+        if let Some((_, end)) =
+            protected.iter().find(|(start, end)| *start <= position && position < *end)
+        {
+            position = *end;
+            continue;
+        }
         let (candidate, incomplete_display) =
             if grid.starts_with(position, &['$', '$']) && !grid.is_escaped(position) {
                 let candidate = find_formula(
@@ -1526,5 +1537,6 @@ pub(super) fn make_overlay(
         formula_neighbours_below: [false; MAX_ABSORBED_BLANK_ROWS],
         widen_right_to: None,
         inline_reflow_end: None,
+        clip_rows: None,
     }
 }

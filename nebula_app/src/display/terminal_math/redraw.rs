@@ -2,9 +2,79 @@
 
 use super::*;
 
+/// A content rectangle proven by fixed edge rows in two redraw snapshots.
+/// Keep its fingerprint so a later UI/layout change cannot silently hide edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TuiClip {
+    pub(super) top: i64,
+    pub(super) bottom: i64,
+    fingerprint: u64,
+}
+
+impl TuiClip {
+    pub(super) fn contains(self, row: i64) -> bool {
+        (self.top..self.bottom).contains(&row)
+    }
+
+    fn edge_fingerprint(self, grid: &TextGrid) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        grid.absolute_top.hash(&mut hasher);
+        grid.rows.len().hash(&mut hasher);
+        for (row, cells) in grid.rows.iter().enumerate() {
+            if !self.contains(grid.absolute_top as i64 + row as i64) {
+                row.hash(&mut hasher);
+                cells.hash(&mut hasher);
+                grid.wrapped[row].hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
+    pub(super) fn matches(self, grid: &TextGrid) -> bool {
+        self.fingerprint == self.edge_fingerprint(grid)
+    }
+
+    fn stationary_edges(previous: &TextGrid, grid: &TextGrid) -> Option<Self> {
+        if previous.rows.len() != grid.rows.len() {
+            return None;
+        }
+        let unchanged = |row: usize| {
+            previous.rows[row] == grid.rows[row] && previous.wrapped[row] == grid.wrapped[row]
+        };
+        let informative = |range: std::ops::Range<usize>| {
+            grid.rows[range].iter().flatten().any(|cell| cell.is_some_and(char::is_alphanumeric))
+        };
+        let mut top = 0;
+        while top < grid.rows.len() && unchanged(top) {
+            top += 1;
+        }
+        if !informative(0..top) {
+            top = 0;
+        }
+        let mut bottom = grid.rows.len();
+        while bottom > top && unchanged(bottom - 1) {
+            bottom -= 1;
+        }
+        if !informative(bottom..grid.rows.len()) {
+            bottom = grid.rows.len();
+        }
+        if top == bottom || top == 0 && bottom == grid.rows.len() {
+            return None;
+        }
+        let mut clip = Self {
+            top: grid.absolute_top as i64 + top as i64,
+            bottom: grid.absolute_top as i64 + bottom as i64,
+            fingerprint: 0,
+        };
+        clip.fingerprint = clip.edge_fingerprint(grid);
+        Some(clip)
+    }
+}
+
 impl TerminalMathState {
-    pub(super) fn relocate_tui_formulas(&mut self, grid: &TextGrid) {
+    pub(super) fn relocate_tui_formulas(&mut self, grid: &mut TextGrid) {
         let Some((previous, _)) = &self.last_scan else { return };
+        grid.tui_clip = previous.tui_clip.filter(|clip| clip.matches(grid));
         if previous == grid
             || previous.columns != grid.columns
             || previous.absolute_top != grid.absolute_top
@@ -34,6 +104,7 @@ impl TerminalMathState {
         // prove that the surrounding document is still the same document.
         let before = unique_content_rows(previous);
         let after = unique_content_rows(grid);
+        let clip = TuiClip::stationary_edges(previous, grid).or(grid.tui_clip);
         let moves: Vec<_> = candidates
             .into_iter()
             .filter_map(|(&anchor, formula)| {
@@ -51,7 +122,7 @@ impl TerminalMathState {
                     let delta = *next as i64 - row as i64;
                     if delta == 0
                         || matched == Some(delta)
-                        || !formula.matches_shifted_rows(grid, delta)
+                        || !formula.matches_shifted_rows(grid, delta, clip)
                     {
                         continue;
                     }
@@ -63,6 +134,7 @@ impl TerminalMathState {
                 let delta = matched?;
                 let mut moved = formula.clone();
                 moved.anchor.row += delta;
+                moved.clip = clip;
                 for span in &mut moved.spans {
                     span.row += delta;
                 }
@@ -73,6 +145,7 @@ impl TerminalMathState {
             return;
         }
 
+        grid.tui_clip = clip;
         // Move as a batch so one destination cannot erase another formula
         // before its source rows have been checked against the previous frame.
         for (anchor, _) in &moves {
@@ -110,13 +183,13 @@ fn unique_content_rows(grid: &TextGrid) -> BTreeMap<u64, Option<usize>> {
 }
 
 impl PersistedFormula {
-    fn matches_shifted_rows(&self, grid: &TextGrid, delta: i64) -> bool {
+    fn matches_shifted_rows(&self, grid: &TextGrid, delta: i64, clip: Option<TuiClip>) -> bool {
         let mut compared = false;
         for span in &self.spans {
             let Ok(row) = usize::try_from(span.row + delta - grid.absolute_top as i64) else {
                 continue;
             };
-            if row >= grid.rows.len() {
+            if row >= grid.rows.len() || clip.is_some_and(|clip| !clip.contains(span.row + delta)) {
                 continue;
             }
             // Unlike the stationary redraw tolerance, relocation needs every
@@ -146,10 +219,11 @@ mod tests {
     }
 
     fn scan(state: &mut TerminalMathState, grid: &TextGrid) -> Vec<FormulaOverlay> {
-        state.synchronize_grid(grid);
-        state.relocate_tui_formulas(grid);
-        state.scan_visible_grid(grid, None);
-        state.visible_overlays(grid)
+        let mut grid = grid.clone();
+        state.synchronize_grid(&grid);
+        state.relocate_tui_formulas(&mut grid);
+        state.scan_visible_grid(&grid, None);
+        state.visible_overlays(&grid)
     }
 
     #[test]
@@ -185,6 +259,27 @@ mod tests {
             let mut state = TerminalMathState::default();
             assert_eq!(scan(&mut state, &grid(&[r"\[", "x^2", r"\]", "after", ""])).len(), 1);
             assert!(scan(&mut state, &moved).is_empty());
+        }
+    }
+
+    #[test]
+    fn fixed_edge_clip_does_not_hide_source_edits_or_ui_changes() {
+        let initial = grid(&["QUESTION", r"\[", "a^2", "c+d", r"\]", "after", "", "BACK", "INPUT"]);
+        let moved =
+            grid(&["QUESTION", "earlier", "more", "context", r"\[", "a^2", "c+d", "BACK", "INPUT"]);
+        for changed in [
+            grid(&["QUESTION", "earlier", "more", "context", r"\[", "a^2", "c+e", "BACK", "INPUT"]),
+            grid(&[
+                "QUESTION", "earlier", "more", "context", r"\[", "a^2", "c+d", "EDITED", "INPUT",
+            ]),
+        ] {
+            let mut state = TerminalMathState::default();
+            let original = scan(&mut state, &initial)[0].source_arc();
+            let formulas = scan(&mut state, &moved);
+            assert_eq!(formulas.len(), 1);
+            assert_eq!(formulas[0].source, original);
+            assert_eq!(formulas[0].clip_rows, Some((1, 7)));
+            assert!(scan(&mut state, &changed).is_empty());
         }
     }
 
