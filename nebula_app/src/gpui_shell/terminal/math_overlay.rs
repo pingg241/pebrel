@@ -689,6 +689,65 @@ mod tests {
     }
 
     #[test]
+    fn tui_redraw_scroll_keeps_a_partially_visible_formula() {
+        use nebula_terminal::event_loop::StreamProcessor;
+
+        for split_clear in [false, true] {
+            let mut term =
+                Term::new(Config::default(), &TestSize { cols: 64, rows: 9 }, VoidListener);
+            let mut stream = StreamProcessor::default();
+            stream.feed(&mut term, &VoidListener, b"\x1b[?1049h");
+            let rows =
+                ["HEADER", r"\[", r"\frac{a+b}{c+d}", r"+\frac{e+f}{g+h}", r"\]", "after", "more"];
+            let mut overlay = MathOverlay::default();
+            let mut original = None;
+            for offset in [0, 1, 2, 3, 2, 1, 0] {
+                // The TUI scrolls its document by repainting the alternate
+                // screen; terminal scrollback and absolute_top do not change.
+                if split_clear {
+                    stream.feed(&mut term, &VoidListener, b"\x1b[H\x1b[2J");
+                    assert!(plan(&mut overlay, &term, 64, 9).is_empty());
+                }
+                let output = format!("\x1b[H\x1b[2J{}\x1b[9;1H", rows[offset..].join("\r\n"));
+                stream.feed(&mut term, &VoidListener, output.as_bytes());
+                assert_eq!(term.grid().history_size(), 0);
+                for _ in 0..2 {
+                    let frame = plan(&mut overlay, &term, 64, 9);
+                    assert_eq!(
+                        frame.formulas.len(),
+                        1,
+                        "redraw offset {offset}, clear={split_clear}"
+                    );
+                    let formula = &frame.formulas[0];
+                    assert_eq!(
+                        formula.source.split_whitespace().collect::<Vec<_>>().join(" "),
+                        r"\frac{a+b}{c+d} +\frac{e+f}{g+h}"
+                    );
+                    let initial = original.get_or_insert(formula.plan);
+                    assert_eq!(formula.plan.fitted_pixel_size, initial.fitted_pixel_size);
+                    assert!(
+                        (formula.plan.baseline_y - (initial.baseline_y - offset as f32 * 16.0))
+                            .abs()
+                            < 0.001
+                    );
+                    assert!(frame.covers(1usize.saturating_sub(offset), 0));
+                    assert!(!frame.covers(5 - offset, 0));
+                }
+            }
+            // Leaving and re-entering the alternate screen invalidates its
+            // cached source even if the new screen resembles the old tail.
+            stream.feed(&mut term, &VoidListener, b"\x1b[?1049l");
+            assert!(plan(&mut overlay, &term, 64, 9).is_empty());
+            stream.feed(
+                &mut term,
+                &VoidListener,
+                b"\x1b[?1049h\x1b[H\x1b[2J+\\frac{e+f}{g+h}\r\n\\]\r\nafter\x1b[9;1H",
+            );
+            assert!(plan(&mut overlay, &term, 64, 9).is_empty());
+        }
+    }
+
+    #[test]
     fn native_source_filter_excludes_hidden_formulas_and_keeps_visible_tail() {
         let term = term_with(24, 8, &[r"$x_1$", "", r"$y_2$", "", r"$z_3$"]);
         let size = grid_size_info(24, 8, 8.0, 16.0);

@@ -455,8 +455,23 @@ pub(crate) fn scan_visible<T>(
 ) -> Vec<FormulaOverlay> {
     let grid = TextGrid::from_term(terminal, size, 0, &include);
     let active_edit_rows = cursor.and_then(|cursor| grid.logical_rows_containing(cursor.line));
+    let alternate_screen = terminal.mode().contains(nebula_terminal::term::TermMode::ALT_SCREEN);
+    if state.alternate_screen != alternate_screen {
+        state.clear_formulas();
+        state.alternate_screen = alternate_screen;
+    }
     state.synchronize_grid(&grid);
-    if let Some(anchor) = state.scan_visible_grid(&grid, active_edit_rows.as_ref()) {
+    if alternate_screen {
+        // A clear-screen and the subsequent redraw can arrive in separate PTY
+        // reads. Paint nothing during the clear, but keep the last content
+        // snapshot so the next redraw can still prove its row displacement.
+        if grid.rows.iter().flatten().all(|cell| cell.is_none_or(|ch| ch == ' ')) {
+            return Vec::new();
+        }
+        state.relocate_tui_formulas(&grid);
+    }
+    let history_anchor = state.scan_visible_grid(&grid, active_edit_rows.as_ref());
+    if let Some(anchor) = history_anchor.filter(|_| !alternate_screen) {
         // `extract` counts every terminal cell toward the 16 KiB parser limit.
         // Deriving the row cap from the current width keeps this rare temporary
         // grid near 64 KiB of cell data instead of scanning all scrollback.
@@ -468,10 +483,10 @@ pub(crate) fn scan_visible<T>(
         // A viewport anchor means the pending delimiter is an orphan closer
         // whose opener sits somewhere above; its depth is unknown, so look
         // back by the full source budget instead of an exact distance.
-        let lookback = if anchor.row >= grid.absolute_top {
+        let lookback = if anchor.row >= grid.absolute_top as i64 {
             source_rows
         } else {
-            grid.absolute_top - anchor.row
+            (grid.absolute_top as i64 - anchor.row) as usize
         };
         if lookback <= source_rows {
             let history = TextGrid::from_term(terminal, size, lookback, &include);

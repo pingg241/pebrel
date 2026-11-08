@@ -4,6 +4,8 @@
 //! scrollback, cursor positions, selections, or copied text. It only replaces
 //! visible delimiter spans during the final paint pass.
 
+#[path = "terminal_math/redraw.rs"]
+mod redraw;
 #[path = "terminal_math/scan.rs"]
 mod scan;
 pub(crate) use scan::scan_visible;
@@ -104,6 +106,7 @@ pub(crate) struct TerminalMathState {
     max_formula_rows: usize,
     columns: Option<usize>,
     last_scrolled_out: Option<usize>,
+    alternate_screen: bool,
     pending_display: Option<PendingDisplayFormula>,
 }
 
@@ -119,6 +122,7 @@ impl Default for TerminalMathState {
             max_formula_rows: 0,
             columns: None,
             last_scrolled_out: None,
+            alternate_screen: false,
             pending_display: None,
         }
     }
@@ -245,16 +249,16 @@ impl TerminalMathState {
                 // a new opener can replace both it and the next formula.
                 let start = self
                     .formulas
-                    .range(..FormulaAnchor { row: grid.absolute_top, column: 0 })
+                    .range(..FormulaAnchor { row: grid.absolute_top as i64, column: 0 })
                     .next_back()
                     .map(|(_, formula)| formula)
                     .filter(|formula| {
-                        formula.last_row() >= grid.absolute_top
+                        formula.last_row() >= grid.absolute_top as i64
                             && formula.matches_visible_rows(grid)
                     })
                     .and_then(|formula| formula.spans.last())
                     .map_or(GridPosition { row: 0, column: 0 }, |span| GridPosition {
-                        row: span.row - grid.absolute_top,
+                        row: (span.row - grid.absolute_top as i64) as usize,
                         column: span.end,
                     });
                 let scan = scan_grid_from(grid, start);
@@ -285,7 +289,7 @@ impl TerminalMathState {
             return None;
         }
         let current = FormulaAnchor {
-            row: grid.absolute_top.saturating_add(position.row),
+            row: grid.absolute_top.saturating_add(position.row) as i64,
             column: position.column,
         };
 
@@ -339,7 +343,7 @@ impl TerminalMathState {
             let opens_at_pending = overlay_anchor(history, &overlay) == Some(pending.anchor);
             let closes_at_pending = overlay.spans.last().is_some_and(|span| {
                 usize::try_from(span.row).ok().and_then(|row| history.absolute_top.checked_add(row))
-                    == Some(pending.anchor.row)
+                    == usize::try_from(pending.anchor.row).ok()
                     && span.end >= 2
                     && span.end - 2 == pending.anchor.column
             });
@@ -398,14 +402,14 @@ impl TerminalMathState {
             return Vec::new();
         }
 
-        let viewport_bottom = grid.absolute_top.saturating_add(grid.rows.len() - 1);
-        let search_top = grid.absolute_top.saturating_sub(self.max_formula_rows.saturating_sub(1));
+        let viewport_bottom = grid.absolute_top.saturating_add(grid.rows.len() - 1) as i64;
+        let search_top = grid.absolute_top as i64 - self.max_formula_rows.saturating_sub(1) as i64;
         let lower = FormulaAnchor { row: search_top, column: 0 };
         let upper = FormulaAnchor { row: viewport_bottom, column: usize::MAX };
         let candidates: Vec<_> = self
             .formulas
             .range(lower..=upper)
-            .filter(|(_, formula)| formula.intersects(grid.absolute_top, viewport_bottom))
+            .filter(|(_, formula)| formula.intersects(grid.absolute_top as i64, viewport_bottom))
             .map(|(&anchor, formula)| (anchor, formula.matches_visible_rows(grid)))
             .collect();
 
@@ -425,14 +429,14 @@ impl TerminalMathState {
     }
 
     fn prune_before(&mut self, absolute_floor: usize) {
-        if self.pending_display.is_some_and(|pending| pending.anchor.row < absolute_floor) {
+        if self.pending_display.is_some_and(|pending| pending.anchor.row < absolute_floor as i64) {
             self.pending_display = None;
         }
         loop {
             let stale = self
                 .formulas
                 .first_key_value()
-                .filter(|(_, formula)| formula.last_row() < absolute_floor)
+                .filter(|(_, formula)| formula.last_row() < absolute_floor as i64)
                 .map(|(&anchor, _)| anchor);
             match stale {
                 Some(anchor) => self.remove(anchor),
@@ -453,6 +457,7 @@ impl TerminalMathState {
     }
 
     fn clear_formulas(&mut self) {
+        self.last_scan = None;
         self.formulas.clear();
         self.persisted_bytes = 0;
         self.max_formula_rows = 0;
@@ -482,7 +487,8 @@ impl TerminalMathState {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct FormulaAnchor {
-    row: usize,
+    // Alternate-screen redraws can leave the opener above physical row zero.
+    row: i64,
     column: usize,
 }
 
@@ -506,12 +512,12 @@ struct PendingDisplayFormula {
 fn overlay_anchor(grid: &TextGrid, overlay: &FormulaOverlay) -> Option<FormulaAnchor> {
     let first = overlay.spans.first()?;
     let row = usize::try_from(first.row).ok()?;
-    Some(FormulaAnchor { row: grid.absolute_top.checked_add(row)?, column: first.start })
+    Some(FormulaAnchor { row: grid.absolute_top.checked_add(row)? as i64, column: first.start })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PersistedRowSpan {
-    row: usize,
+    row: i64,
     start: usize,
     end: usize,
     fingerprint: u64,
@@ -536,7 +542,7 @@ impl PersistedFormula {
             let include_wrap = index + 1 < overlay.spans.len();
             let fingerprint = grid.span_fingerprint(row, span.start, span.end, include_wrap)?;
             spans.push(PersistedRowSpan {
-                row: grid.absolute_top.checked_add(row)?,
+                row: grid.absolute_top.checked_add(row)? as i64,
                 start: span.start,
                 end: span.end,
                 fingerprint,
@@ -559,7 +565,7 @@ impl PersistedFormula {
     }
 
     fn row_count(&self) -> usize {
-        self.last_row().saturating_sub(self.anchor.row).saturating_add(1)
+        self.last_row().saturating_sub(self.anchor.row).saturating_add(1) as usize
     }
 
     fn same_content(&self, other: &Self) -> bool {
@@ -577,18 +583,18 @@ impl PersistedFormula {
         })
     }
 
-    fn last_row(&self) -> usize {
+    fn last_row(&self) -> i64 {
         self.spans.last().map_or(self.anchor.row, |span| span.row)
     }
 
-    fn intersects(&self, top: usize, bottom: usize) -> bool {
+    fn intersects(&self, top: i64, bottom: i64) -> bool {
         self.anchor.row <= bottom && self.last_row() >= top
     }
 
     fn matches_visible_rows(&self, grid: &TextGrid) -> bool {
         let mut compared = false;
         for span in &self.spans {
-            let Some(row) = span.row.checked_sub(grid.absolute_top) else {
+            let Ok(row) = usize::try_from(span.row - grid.absolute_top as i64) else {
                 continue;
             };
             if row >= grid.rows.len() {
@@ -638,12 +644,8 @@ impl PersistedFormula {
     }
 }
 
-fn relative_row(row: usize, absolute_top: usize) -> i32 {
-    if row >= absolute_top {
-        i32::try_from(row - absolute_top).unwrap_or(i32::MAX)
-    } else {
-        -i32::try_from(absolute_top - row).unwrap_or(i32::MAX)
-    }
+fn relative_row(row: i64, absolute_top: usize) -> i32 {
+    (row - absolute_top as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
